@@ -17,25 +17,40 @@ async def generate_rhinestone_api(
         # ── Read image ────────────────────────────────────────────────────────
         contents = await image.read()
         nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        # Read with alpha channel support (handles transparent PNGs)
+        img_raw = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
 
-        if img is None:
+        if img_raw is None:
             return {"status": "error", "error": "Could not decode image."}
 
+        # ── Flatten to greyscale, handling transparency correctly ─────────────
+        if img_raw.ndim == 2:
+            # Already greyscale
+            img = img_raw
+        elif img_raw.shape[2] == 4:
+            # RGBA: composite onto white background first, then greyscale
+            alpha = img_raw[:, :, 3:4].astype(np.float32) / 255.0
+            rgb   = img_raw[:, :, :3].astype(np.float32)
+            white = np.ones_like(rgb) * 255.0
+            composited = (rgb * alpha + white * (1 - alpha)).astype(np.uint8)
+            img = cv2.cvtColor(composited, cv2.COLOR_BGR2GRAY)
+        else:
+            # BGR: just convert to greyscale
+            img = cv2.cvtColor(img_raw, cv2.COLOR_BGR2GRAY)
+
         # ── Pre-process: mild blur to remove noise before thresholding ────────
-        # Without this, JPEG compression artifacts create stray isolated dots.
         blurred = cv2.GaussianBlur(img, (5, 5), 0)
 
         # Dark pixels → white (active), light background → black
         _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY_INV)
 
         # ── Remove tiny isolated blobs (stray dots from noise) ────────────────
-        # Erode then dilate (opening) removes specks smaller than the kernel.
         kernel = np.ones((3, 3), np.uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
 
         # ── Physical scaling ──────────────────────────────────────────────────
         h_pixels, w_pixels = thresh.shape
+        print(f"Image: {w_pixels}x{h_pixels}px | {target_width_mm}mm wide | {w_pixels/target_width_mm:.2f}px/mm")
         pixels_per_mm = w_pixels / target_width_mm
         target_height_mm = h_pixels / pixels_per_mm
 

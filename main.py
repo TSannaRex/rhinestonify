@@ -6,7 +6,6 @@ import math
 
 app = FastAPI()
 
-# 1. The API Endpoint (Catches the request from app.js)
 @app.post("/api/generate")
 async def generate_rhinestone_api(
     image: UploadFile = File(...),
@@ -15,63 +14,104 @@ async def generate_rhinestone_api(
     spacing_mm: float = Form(...)
 ):
     try:
-        # Read the uploaded image into memory
+        # ── Read image ────────────────────────────────────────────────────────
         contents = await image.read()
         nparr = np.frombuffer(contents, np.uint8)
-        
-        # Convert image to grayscale
         img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        
-        # Create a binary mask (dark pixels become white/active, background becomes black)
-        _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
-        
-        # Calculate physical scaling (Pixels to Millimeters)
+
+        if img is None:
+            return {"status": "error", "error": "Could not decode image."}
+
+        # ── Pre-process: mild blur to remove noise before thresholding ────────
+        # Without this, JPEG compression artifacts create stray isolated dots.
+        blurred = cv2.GaussianBlur(img, (5, 5), 0)
+
+        # Dark pixels → white (active), light background → black
+        _, thresh = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY_INV)
+
+        # ── Remove tiny isolated blobs (stray dots from noise) ────────────────
+        # Erode then dilate (opening) removes specks smaller than the kernel.
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+
+        # ── Physical scaling ──────────────────────────────────────────────────
         h_pixels, w_pixels = thresh.shape
         pixels_per_mm = w_pixels / target_width_mm
         target_height_mm = h_pixels / pixels_per_mm
-        
-        # Hexagonal Grid Math
-        step = stone_size_mm + spacing_mm
-        row_height = step * math.sin(math.radians(60))
-        
+
+        # ── Hexagonal grid math ───────────────────────────────────────────────
+        step = stone_size_mm + spacing_mm          # centre-to-centre distance
+        row_height = step * math.sin(math.radians(60))  # ~0.866 * step
+
+        # Stone radius in the SVG: slightly smaller than half the stone diameter
+        # so there is always a visible gap between stones in the preview.
+        # The actual cut radius IS exactly stone_size_mm/2 — that is what the
+        # cutter uses. We just render slightly smaller so they don't visually merge.
+        svg_radius = (stone_size_mm / 2) * 0.92
+
+        # Pad the grid by one radius so edge stones aren't clipped
+        radius_mm = stone_size_mm / 2
+        x_start = radius_mm
+        y_start = radius_mm
+        x_end   = target_width_mm  - radius_mm
+        y_end   = target_height_mm - radius_mm
+
+        rows = int((y_end - y_start) / row_height) + 1
+        cols = int((x_end - x_start) / step) + 1
+
         circles = []
-        rows = int(target_height_mm / row_height)
-        cols = int(target_width_mm / step)
-        
-        # Generate the grid points and check against the image
+
         for r in range(rows):
             for c in range(cols):
-                x = c * step
+                x = x_start + c * step
                 # Offset every other row for the honeycomb effect
                 if r % 2 == 1:
-                    x += step / 2 
-                y = r * row_height
-                
-                # Convert physical coordinates back to pixels to check the mask
-                px = int(x * pixels_per_mm)
-                py = int(y * pixels_per_mm)
-                
-                # If point is inside bounds AND lands on the design, place a stone
-                if px < w_pixels and py < h_pixels:
-                    if thresh[py, px] == 255: 
-                        circles.append((x, y))
-                        
-        # Construct the SVG string (Using the Amethyst color from your CSS)
-        svg_content = f'<svg width="{target_width_mm}mm" height="{target_height_mm}mm" viewBox="0 0 {target_width_mm} {target_height_mm}" xmlns="http://www.w3.org/2000/svg">\n'
+                    x += step / 2
+
+                y = y_start + r * row_height
+
+                # Skip stones that would extend beyond the canvas
+                if x > x_end or y > y_end:
+                    continue
+
+                # Convert physical coords to pixel coords for mask lookup
+                px = int(round(x * pixels_per_mm))
+                py = int(round(y * pixels_per_mm))
+
+                # Clamp to valid pixel range
+                px = max(0, min(px, w_pixels - 1))
+                py = max(0, min(py, h_pixels - 1))
+
+                # Place a stone only if the centre pixel is inside the design
+                if thresh[py, px] == 255:
+                    circles.append((x, y))
+
+        # ── Build SVG ─────────────────────────────────────────────────────────
+        svg_lines = [
+            f'<svg width="{target_width_mm}mm" height="{target_height_mm:.2f}mm" '
+            f'viewBox="0 0 {target_width_mm} {target_height_mm:.2f}" '
+            f'xmlns="http://www.w3.org/2000/svg">'
+        ]
+
         for cx, cy in circles:
-            svg_content += f'  <circle cx="{cx:.2f}" cy="{cy:.2f}" r="{stone_size_mm/2:.2f}" fill="#7c5cbf" />\n'
-        svg_content += '</svg>'
-        
-        # Return the exact JSON structure app.js is expecting
+            svg_lines.append(
+                f'  <circle cx="{cx:.3f}" cy="{cy:.3f}" r="{svg_radius:.3f}" fill="#7c5cbf" />'
+            )
+
+        svg_lines.append('</svg>')
+        svg_content = '\n'.join(svg_lines)
+
         return {
             "status": "success",
             "stone_count": len(circles),
             "svg_data": svg_content
         }
-        
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {"status": "error", "error": str(e)}
 
-# 2. Serve the Frontend UI
-# We put this at the bottom so it doesn't overwrite the /api route
+
+# Serve frontend — must be last so /api routes are registered first
 app.mount("/", StaticFiles(directory="public", html=True), name="public")
